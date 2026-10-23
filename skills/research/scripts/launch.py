@@ -25,7 +25,6 @@ import urllib.request
 import uuid
 
 SERVER = 'https://ask-gateway.r95426882.workers.dev'
-SERVER_ALIASES = {SERVER, 'https://34.14.204.251'}
 DEFAULT_STATE = Path.home() / 'Library/Application Support/HelperRunner'
 PREFIX = '/api/device/helper-bootstrap/sessions'
 EXPECTED_MODEL = 'abliterated-model-large-flash'
@@ -195,29 +194,27 @@ def available_clis(provider, selected_binary):
     return paths
 
 
-def registration(state, server, label, reuse):
+def read_device(state, reference=None):
+    """Read credentials only from this connection's own regular device file."""
+    state = Path(state).absolute()
     destination = state / 'device.json'
-    if destination.exists():
-        config = read(destination)
+    if reference is not None and Path(reference).absolute() != destination:
+        raise RuntimeError('This connection references credentials outside its own state directory; use a fresh state directory')
+    if destination.is_symlink() or not destination.is_file():
+        raise RuntimeError('This connection needs its own regular device.json file')
+    config = read(destination)
+    if Path(config.get('state_dir', '')).absolute() != state:
+        raise RuntimeError('Device state belongs to another installation; use a fresh state directory')
+    return config
+
+
+def registration(state, server, label, reuse=False):
+    destination = state / 'device.json'
+    if destination.exists() or destination.is_symlink():
+        config = read_device(state)
         if origin(config['server_url']) != server:
             raise RuntimeError('This state directory belongs to another server')
-        return config, destination, bool(config.get('bootstrap_reuse_existing'))
-    if reuse:
-        candidates = [Path.home() / 'Library/Application Support/DeviceAgent/config.json',
-                      Path.home() / 'Library/Application Support/DeviceAgent/device.json',
-                      Path.home() / 'Library/Caches/ask-runner/device.json']
-        for candidate in candidates:
-            if not candidate.exists():
-                continue
-            with contextlib.suppress(KeyError, ValueError, RuntimeError, OSError):
-                config = read(candidate)
-                prior = origin(config['server_url'])
-                if prior != server and not {prior, server} <= SERVER_ALIASES:
-                    continue
-                config = {**config, 'server_url': server}
-                # The server checks whether this existing helper is healthy before reuse.
-                api(config, '/api/device/setup/manifest')
-                return config, candidate, True
+        return config, destination, False
     intent_path = state / 'enrollment-intent.json'
     if not intent_path.exists():
         save(intent_path, {'device_id': str(uuid.uuid4()), 'enrollment_nonce': str(uuid.uuid4())})
@@ -499,7 +496,7 @@ def main():
             session = read(state / 'session.json')
             if session.get('id'):
                 try:
-                    receipt['server'] = api(read(session['credential_file']), session_endpoint(session['id']))
+                    receipt['server'] = api(read_device(state, session['credential_file']), session_endpoint(session['id']))
                 except RuntimeError as error:
                     receipt['server_error'] = str(error)
         print(json.dumps(receipt, indent=2))
@@ -530,7 +527,7 @@ def main():
                 raise RuntimeError('Previous runner may still be running; inspect it before retrying')
         if old.get('status') == 'ready':
             session = read(state / 'session.json')
-            result = api(read(session['credential_file']), session_endpoint(session['id']))
+            result = api(read_device(state, session['credential_file']), session_endpoint(session['id']))
             if result['status'] == 'ready' and result.get('helper_fresh', False):
                 os.close(fd)
                 print(json.dumps({'status': 'already_ready', 'state_dir': str(state), 'server': result}))
@@ -541,7 +538,7 @@ def main():
             raise RuntimeError('Use a separate state directory for another server/provider')
     save(state / 'receipt.json', {'status': 'starting', 'provider': args.provider, 'binary': binary,
          'server_url': server, 'label': args.label, 'launchagent_label': args.launchagent_label,
-         'reuse': state == DEFAULT_STATE.resolve(), 'started_at': time.time()})
+         'reuse': False, 'started_at': time.time()})
     child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '_run', '--state-dir', str(state),
                               '--lock-fd', str(fd)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True, pass_fds=(fd,))

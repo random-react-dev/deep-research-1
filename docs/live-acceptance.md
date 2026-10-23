@@ -56,3 +56,9 @@ The acceptance question compared R2 multipart cleanup with GCS resumable-session
 Both test connections, background services and server records were removed after completion; evidence and example reports remain privately outside the repository. The original ASK source and all 19 old installation/skill baseline hashes remain unchanged.
 
 Final research-first regression run: **235 tests passed**, eight subtests passed; the skill validator passed.
+
+## Credential and report boundary update
+
+The client no longer searches other installation directories for credentials. Tests verify fresh registration even when the old reuse flag is supplied, reuse of its own registration, rejection of foreign credential references before reads, rejection of symlinked credentials and mismatched state roots, and blocking of old research receipts that reference another installation. Returned reports include untrusted-data metadata separate from report text; an adversarial report cannot replace that metadata in the JSON output. Stored report bytes and checksums are unchanged.
+
+Regression result: **241 tests passed**, eight subtests passed. Existing local HTTP research/recovery and signed setup fixtures passed. This change does not add approval prompts or remove the existing shell/background-service capabilities; no new external-model run or audit-rating improvement is claimed.

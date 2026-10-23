@@ -19,3 +19,5 @@ Live installation, worker execution, file-upload and cleanup results must be rep
 Provider compatibility correction: the live Messages endpoint rejected documented `thinking: false` with HTTP 400 (object required). The proxy uses the native `thinking: {"type":"disabled"}` shape and `output_config.effort: "low"`; this corrected object passed both the real Claude setup and subsequent worker task.
 
 Signed launchers reject tampered, incorrectly signed, expired and model/catalog-mismatched envelopes before starting a model attempt. The runner executes the reviewed archive-validation instructions; unrestricted model shell behavior is not constrained by a sandbox. A compromised model/proxy or local account remains outside these signature protections.
+
+Credential discovery in older installations has been removed. Foreign credential references and symlinked device files are rejected before reading. Report output carries `report_trust: "untrusted"` and a separate notice; SKILL.md applies the same rule to full-file reads and deliverables. These labels guide the receiving agent; they are not a sandbox or a guarantee against prompt injection.
