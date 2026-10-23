@@ -22,3 +22,5 @@ The final setup tests used separate device registrations, directories and Launch
 Failure tests and limits are described in verification-boundaries.md. Download disconnect/checksum tests use a real local HTTP fault fixture and curl, not a billed model. This release does not claim a full-machine reboot test or that every model error is recoverable.
 
 Final combined regression run: **173 passed**, three subtests passed, one dependency deprecation warning. Includes the actual Codex catalog/request fixture and download-fault fixtures. Earlier Rust unit and resumable-upload integration runs passed (7 and 8 tests respectively).
+
+Publication check: the repository is public and anonymously readable. The exact command `npx skills add random-react-dev/helper-runner` completed in an isolated project, discovered one skill, and installed exactly `SKILL.md` and `scripts/launch.py`. Both files match the published source.
