@@ -3,7 +3,7 @@
 Ask a question and get a sourced research report. Uses the existing Research Gateway with Codex or Claude and the server-backed Abliteration Large Flash model.
 
 ```sh
-npx skills add random-react-dev/deep-reserach
+npx skills add random-react-dev/deep-research-1
 ```
 
 Then ask your agent: **Use research to investigate my question.** This repository provides one skill named `research`.

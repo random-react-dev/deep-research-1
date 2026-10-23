@@ -75,7 +75,7 @@ Record actual results separately; this checklist is not evidence that a test ran
 7. Change a harmless server instruction for a new session; the same installed skill must follow it without modification.
 8. Run resumable-upload regressions. Process interruption is not a physical restart test; label evidence accurately.
 9. Stop and remove only test-owned LaunchAgents, directories and registrations. Compare old-installation fingerprints afterward.
-10. Test anonymous skill installation in an isolated temporary directory using `npx skills add random-react-dev/deep-reserach`. The public repository must contain no generated secret files or evidence containing credentials.
+10. Test anonymous skill installation in an isolated temporary directory using `npx skills add random-react-dev/deep-research-1`. The public repository must contain no generated secret files or evidence containing credentials.
 
 ## Local results during initial build
 
