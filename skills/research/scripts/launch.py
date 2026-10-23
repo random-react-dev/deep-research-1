@@ -185,6 +185,16 @@ def prerequisites(provider):
     return str(Path(binary).resolve())
 
 
+def available_clis(provider, selected_binary):
+    paths = {provider: selected_binary}
+    for optional in ('codex', 'claude'):
+        if optional != provider:
+            binary = shutil.which(optional)
+            if binary:
+                paths[optional] = str(Path(binary).resolve())
+    return paths
+
+
 def registration(state, server, label, reuse):
     destination = state / 'device.json'
     if destination.exists():
@@ -384,7 +394,7 @@ def worker(state, lock_fd):
         created = api(config, PREFIX, {'provider': receipt['provider'], 'idempotency_key': session['idempotency_key'],
                    'installation_root': config['state_dir'] if reuse else str(state),
                    'label': receipt['launchagent_label'], 'python': sys.executable,
-                   'cli_paths': {receipt['provider']: receipt['binary']},
+                   'cli_paths': available_clis(receipt['provider'], receipt['binary']),
                    'credential_file': str(credential_file), 'reuse_existing': reuse})
         endpoint = session_endpoint(created['id'])
         session.update(id=created['id'], credential_file=str(credential_file))
@@ -405,7 +415,7 @@ def worker(state, lock_fd):
             context = {'server_url': config['server_url'], 'session_id': session['id'],
                        'installation_root': config['state_dir'] if reuse else str(state),
                        'label': receipt['launchagent_label'], 'python': sys.executable,
-                       'cli_paths': {receipt['provider']: receipt['binary']}, 'credential_file': str(credential_file),
+                       'cli_paths': available_clis(receipt['provider'], receipt['binary']), 'credential_file': str(credential_file),
                        'release': document['release'], 'model': document['model'], 'reuse_existing': reuse}
             context_file = directory / 'setup-context.json'
             instructions_file = directory / 'setup-instructions.md'

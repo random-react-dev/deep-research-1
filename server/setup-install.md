@@ -95,7 +95,7 @@ def main():
     root.chmod(0o700)
     credentials = json.loads(pathlib.Path(context['credential_file']).read_text())
     config = {**credentials, 'server_url': context['server_url'], 'state_dir': str(root),
-              'model': context['model'], 'reasoning_effort':'none', 'poll_seconds':15,
+              'model': context['model'], 'reasoning_effort':'none', 'poll_seconds':15, 'research_gateway_enabled':True,
               'task_agent_command':[context['python'],str(root/'runtime/task_agent.py'),'--config',str(root/'config.json')],
               'uploader_binary':str(root/'bin/device-helper'),'helper_bin':str(root/'bin/device-helper')}
     config.update({key+'_bin':value for key,value in context['cli_paths'].items()})

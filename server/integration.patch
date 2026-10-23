@@ -1,11 +1,14 @@
 --- a/app.py
 +++ b/app.py
-@@ -285,6 +285,9 @@
+@@ -285,6 +285,12 @@
      from runner_profiles import install_routes
      install_routes(app, store, admin, device)
  
 +    from helper_bootstrap import install_routes as install_helper_bootstrap
 +    install_helper_bootstrap(app, store, device)
++
++    from research_jobs import install_routes as install_research_jobs
++    install_research_jobs(app, store, device, disk_uploads)
 +
      @app.post("/api/device/setup/model-token")
      def setup_token(data: SetupToken, device_id=Depends(device)):

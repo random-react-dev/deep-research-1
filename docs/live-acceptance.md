@@ -34,3 +34,25 @@ Both real Codex and Claude runs verified the envelope before model startup, inst
 Final regression result: **203 passed**, eight subtests passed; skill validation passed. Coverage includes real signature validation, tampering/wrong-key/expiry rejection, model/catalog mismatch, preflight failure without model startup, hostile ZIPs, linked destinations and interrupted downloads. Two warnings are a dependency deprecation and an intentionally duplicated hostile ZIP member.
 
 This machine's default Python 3.14 has a broken `plistlib` dependency. The launcher now detects that prerequisite failure clearly; live tests used the working Python 3.12 interpreter. No permission prompts were added. Unrestricted runner permissions and the model/proxy trust boundary remain unchanged.
+
+## Research-first acceptance
+
+The only discovered skill is now `research`, derived from the user's ASK source. It contains SKILL.md plus ask.py and the existing signed launch.py. Original ASK files and global skill installations were not modified.
+
+Release `2026.10.23.6` (SHA-256 `7cb7e015d795dfd9be199749da457f76eac0d42485df5498d42c4c883d129c64`) changes only the model catalog to disable optional native tool search. Actual Codex requests expose ordinary function tools and an MCP namespace of function tools; Abliteration accepted that format. Signed setup revision `2026.10.23.research1` explicitly enables Research Gateway.
+
+| Live check | Codex | Claude |
+| --- | --- | --- |
+| One-time signed setup | First attempt ready | First attempt ready |
+| Successful Research Gateway searches | 8 | 3 |
+| Successful Research Gateway fetches | 8 | 5 |
+| Non-generated report.md returned | 2,714 bytes | 2,828 bytes |
+| Download checksum verified | Yes | Yes |
+| Same question reuses job ID | Yes | Yes |
+| Service online after setup runner exit | Yes | Yes |
+
+The acceptance question compared R2 multipart cleanup with GCS resumable-session expiry. Both reports included official-source citations, the configurable-vs-fixed distinction and uncertainty. This proves actual tool use and report delivery, not perfect factual accuracy for every future research question. Source fetching and synthesis remain separate quality concerns.
+
+Both test connections, background services and server records were removed after completion; evidence and example reports remain privately outside the repository. The original ASK source and all 19 old installation/skill baseline hashes remain unchanged.
+
+Final research-first regression run: **235 tests passed**, eight subtests passed; the skill validator passed.

@@ -46,7 +46,7 @@ def provider_overlay(name, data, profile, patch_tool):
                      context_window=1048576, max_context_window=1048576,
                      input_modalities=['text', 'image'],
                      apply_patch_tool_type=None if patch_tool == 'none' else patch_tool,
-                     multi_agent_version=None, default_reasoning_level='none',
+                     multi_agent_version=None, supports_search_tool=False, default_reasoning_level='none',
                      supported_reasoning_levels=[{'effort': 'none', 'description': 'Thinking disabled; lowest reasoning level'}])
         result = (json.dumps(catalog, indent=2, sort_keys=True) + '\n').encode()
         if b'deepseek' in result.lower():

@@ -1,5 +1,11 @@
 # Testing helper-runner
 
+## Current release: research MCP compatibility
+
+Version `2026.10.23.6` supersedes `.5` by setting the Codex catalog's `supports_search_tool` to false. All five other package members are byte-for-byte unchanged. Archive SHA-256: `7cb7e015d795dfd9be199749da457f76eac0d42485df5498d42c4c883d129c64` (398,362 bytes). Standalone manifest/catalog are in development evidence `release-2026.10.23.6/`.
+
+The actual installed Codex CLI was tested with a local mock MCP server advertising `research_search` and `research_fetch`, plus a dummy local model endpoint. The new catalog emits ordinary function tools and an MCP namespace containing function children, with no native `tool_search` or custom grammar tools. Both MCP initialization/tool listing and presence of both research tools are checked. Nine packaging tests pass. This local capture checks wire definitions; real provider execution and actual gateway research are separate live acceptance tests owned by the release operator. The default `.5` catalog instead emitted native tool discovery; removed feature flags did not change that behavior. The supported model capability was located in OpenAI's official `codex-rs/core/src/tools/spec_plan.rs` and `codex-rs/protocol/src/openai_models.rs`.
+
 ## Signed setup instructions
 
 `server/setup-install.md` and `server/setup-reuse.md` are reviewed, static server instructions. The runner reads only its validated `HELPER_RUNNER_CONTEXT` file for machine-specific values. Installation uses a bounded, no-redirect Python download and verifies the signed archive SHA-256 before any extraction. This supersedes the earlier curl/unzip instruction pattern described in historical tests below.
@@ -20,7 +26,7 @@ Nine packaging tests passed. The actual Codex CLI fixture passed in 0.978 second
 
 The server instructions now include `--retry-all-errors`. Three behavioral tests in `tests/test_download_faults.py` passed against a temporary loopback HTTP server using Apple's `/usr/bin/curl` 8.7.1, plus a fourth check ties the tested flags and fail-closed ordering to the server instruction source. A response interrupted halfway returned curl error 18 with the historical `--retry 3` flags and correctly did not extract. Adding supported `--retry-all-errors` caused a second request, downloaded the complete package, verified SHA-256 and extracted successfully. An intentionally incorrect SHA-256 stopped the `set -eu` shell before creating the extraction directory. This tests the shell transport/integrity pattern only; it does not demonstrate an AI runner repairing a real interrupted setup. No helper or model was launched by these tests.
 
-The system skill validator also reported `Skill is valid!` for `skills/helper-runner`, using the existing development virtual environment.
+The system skill validator also reported `Skill is valid!` for the then-current `skills/helper-runner` (now `skills/research`), using the existing development virtual environment.
 
 The installed skill contains only `SKILL.md` and `scripts/launch.py`. The release builder is a developer tool, not part of the installed skill. It does not install or start anything.
 

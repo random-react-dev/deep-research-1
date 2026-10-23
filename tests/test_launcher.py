@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'skills/helper-runner/scripts/launch.py'
+SCRIPT = Path(__file__).resolve().parents[1] / 'skills/research/scripts/launch.py'
 spec = importlib.util.spec_from_file_location('launcher', SCRIPT)
 launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
@@ -19,7 +19,7 @@ class LauncherTests(unittest.TestCase):
     def test_only_two_installed_files(self):
         files = [p.relative_to(SCRIPT.parents[1]).as_posix() for p in SCRIPT.parents[1].rglob('*')
                  if p.is_file() and '__pycache__' not in p.parts]
-        self.assertEqual(sorted(files), ['SKILL.md', 'scripts/launch.py'])
+        self.assertEqual(sorted(files), ['SKILL.md', 'scripts/ask.py', 'scripts/launch.py'])
 
     def test_private_atomic_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -38,6 +38,15 @@ class LauncherTests(unittest.TestCase):
         with patch.object(launcher.sys, 'platform', 'darwin'), patch.object(launcher.platform, 'machine', return_value='arm64'), patch.object(launcher.shutil, 'which', return_value='/bin/echo') as lookup:
             launcher.prerequisites('claude')
             lookup.assert_called_once_with('claude')
+
+    def test_optional_installed_cli_paths_are_available_without_requiring_them(self):
+        with patch.object(launcher.shutil, 'which', return_value='/bin/echo') as lookup:
+            paths = launcher.available_clis('codex', '/selected/codex')
+            self.assertEqual(paths['codex'], '/selected/codex')
+            self.assertEqual(paths['claude'], str(Path('/bin/echo').resolve()))
+            lookup.assert_called_once_with('claude')
+        with patch.object(launcher.shutil, 'which', return_value=None):
+            self.assertEqual(launcher.available_clis('claude', '/selected/claude'), {'claude':'/selected/claude'})
 
     def test_isolated_provider_settings(self):
         settings = {'model': 'deepseek-flash', 'base_url': 'https://example.com/api/model', 'model_token': 'secret-value', 'model_catalog': {'models': []}}

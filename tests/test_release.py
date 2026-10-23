@@ -90,6 +90,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(model['apply_patch_tool_type'], 'function')
             self.assertEqual(model['context_window'], 1048576)
             self.assertIsNone(model['multi_agent_version'])
+            self.assertFalse(model['supports_search_tool'])
             self.assertIn("'multi_agent_v2', 'goals'", source)
             self.assertIn("effort = 'none'", source)
             self.assertIn('"alwaysThinkingEnabled":false', source)
