@@ -1,4 +1,5 @@
 import hashlib
+import base64
 import os
 import json
 import sys
@@ -105,17 +106,53 @@ def test_release_integrity_and_traversal(system):
     (r/(sha+'.zip')).write_bytes(b'corrupt')
     assert c.get('/api/public/helper-bootstrap/releases/current').status_code==503
 
-def test_instruction_update_pins_per_new_session(system,monkeypatch,tmp_path):
+def setup_envelope(manifest, revision='one', **changes):
+    payload={'schema':1,'revision':revision,'issued_at':time.time()-10,'expires_at':time.time()+3600,'model':'abliterated-model-large-flash','release':manifest,'model_catalog_sha256':'a'*64,'install_instructions':'Verified installation instructions '+revision,'reuse_instructions':'Verify existing helper'}
+    payload.update(changes)
+    # Server only validates structure; signature validation belongs to the launcher.
+    return {'payload':base64.b64encode(json.dumps(payload).encode()).decode(),'signature':base64.b64encode(b'server-test-does-not-verify-signature').decode()}
+
+def test_signed_envelope_pins_per_new_session(system,monkeypatch,tmp_path):
     store,c,a,h,b,r=system
-    text=tmp_path/'instructions.txt';text.write_text('Marker: first')
-    monkeypatch.setenv('HELPER_BOOTSTRAP_INSTRUCTIONS',str(text))
+    release=json.loads((r/'current.json').read_text())
+    location=tmp_path/'signed.json';first=setup_envelope(release);location.write_text(json.dumps(first))
+    monkeypatch.setenv('HELPER_BOOTSTRAP_SIGNED_SETUP',str(location))
+    monkeypatch.setenv('HELPER_BOOTSTRAP_INSTRUCTIONS',str(tmp_path/'must-not-be-read.txt'))
     one=create(system)
-    text.write_text('Marker: second')
-    assert 'Marker: first' in c.get(one['instructions_url'],headers=h).json()['instructions']
+    second=setup_envelope(release,'two');location.write_text(json.dumps(second))
+    assert c.get(one['instructions_url'],headers=h).json()['signed_setup']==first
     c.post('/api/device/helper-bootstrap/sessions/'+one['id']+'/attempt',headers=h,json={'previous_runner_stopped':True})
     c.post('/api/device/helper-bootstrap/sessions/'+one['id']+'/events',headers=h,json={'attempt':1,'event':'failed','message':'failed'})
     b['idempotency_key']='second-key-12345';two=create(system)
-    assert 'Marker: second' in c.get(two['instructions_url'],headers=h).json()['instructions']
+    assert c.get(two['instructions_url'],headers=h).json()['signed_setup']==second
+
+@pytest.mark.parametrize('failure',['missing','malformed','oversized','bad-base64','release','model','expired','schema'])
+def test_invalid_configured_envelope_fails_closed(system,monkeypatch,tmp_path,failure):
+    store,c,a,h,b,r=system;location=tmp_path/'signed.json'
+    release=json.loads((r/'current.json').read_text())
+    envelope=setup_envelope(release)
+    if failure=='missing':pass
+    elif failure=='malformed':location.write_text('{}')
+    elif failure=='oversized':location.write_bytes(b'x'*(1024*1024+1))
+    elif failure=='bad-base64':location.write_text(json.dumps({'payload':'%notbase64','signature':'AA=='}))
+    else:
+        changes={'release':{'sha256':'b'*64}} if failure=='release' else {'model':'wrong'} if failure=='model' else {'expires_at':time.time()-1} if failure=='expired' else {'schema':True}
+        location.write_text(json.dumps(setup_envelope(release,**changes)))
+    monkeypatch.setenv('HELPER_BOOTSTRAP_SIGNED_SETUP',str(location))
+    result=c.post('/api/device/helper-bootstrap/sessions',headers=h,json=b)
+    assert result.status_code==503,result.text
+    with store.db() as db:assert db.execute('SELECT count(*) FROM helper_bootstrap_sessions').fetchone()[0]==0
+
+@pytest.mark.parametrize('change',[
+    {'installation_root':'relative/path'}, {'credential_file':'/tmp/token\nfile'},
+    {'python':'/usr/bin/python\x00'}, {'cli_paths':{'bash':'/bin/bash'}},
+    {'cli_paths':{'codex':'codex'}}, {'cli_paths':{'claude':'/bin/claude\r'}},
+    {'label':'com.test; command'}, {'idempotency_key':'key-12345\n'},
+])
+def test_create_rejects_untrusted_path_fields(system,change):
+    store,c,a,h,b,r=system;b.update(change)
+    assert c.post('/api/device/helper-bootstrap/sessions',headers=h,json=b).status_code==422
+
 
 def test_logs_redacted_and_ready_cannot_be_claimed_by_exit(system):
     store,c,a,h,b,r=system;s=create(system);base='/api/device/helper-bootstrap/sessions/'+s['id']
@@ -171,3 +208,16 @@ def test_delete_bootstrap_children_and_preserve_other_device(system,monkeypatch,
         for table in ('helper_bootstrap_tokens','helper_bootstrap_events','helper_bootstrap_sessions','helper_bootstrap_devices'):
             assert db.execute('SELECT count(*) FROM '+table).fetchone()[0]==0
     assert delete_device(store,uploads,device)['deleted']
+
+def test_signature_preflight_failure_without_model_token(system):
+    store,c,a,h,b,r=system;s=create(system);base='/api/device/helper-bootstrap/sessions/'+s['id']
+    assert c.post(base+'/events',headers=h,json={'attempt':0,'event':'progress','message':'invalid'}).status_code==422
+    assert c.post(base+'/events',headers=h,json={'attempt':1,'event':'failed','message':'stale'}).status_code==409
+    response=c.post(base+'/events',headers=h,json={'attempt':0,'event':'failed','message':'Signed instructions failed verification'})
+    assert response.status_code==200 and response.json()['status']=='failed'
+    with store.db() as db:
+        assert db.execute('SELECT count(*) FROM helper_bootstrap_tokens').fetchone()[0]==0
+        assert db.execute('SELECT attempt FROM helper_bootstrap_events').fetchone()[0]==0
+    assert c.post(base+'/events',headers=h,json={'attempt':0,'event':'failed','message':'again'}).status_code==409
+    c.post(base+'/attempt',headers=h,json={'previous_runner_stopped':True})
+    assert c.post(base+'/events',headers=h,json={'attempt':0,'event':'failed','message':'stale'}).status_code==409

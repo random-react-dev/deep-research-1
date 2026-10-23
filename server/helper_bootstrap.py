@@ -1,5 +1,8 @@
 """Additive server-controlled setup: the runner executes instructions; heartbeats prove readiness."""
 import hashlib
+import base64
+import binascii
+import math
 import json
 import os
 import re
@@ -11,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 class Body(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
@@ -24,13 +27,44 @@ class Create(Body):
     cli_paths: dict[str,str] = Field(default_factory=dict)
     credential_file: str = Field(min_length=1,max_length=4096)
     reuse_existing: bool = False
+
+    @field_validator('installation_root','python','credential_file')
+    @classmethod
+    def absolute_path(cls,value):
+        if not Path(value).is_absolute() or any(ord(char)<32 or ord(char)==127 for char in value):
+            raise ValueError('Absolute local paths without control characters required')
+        return value
+
+    @field_validator('cli_paths')
+    @classmethod
+    def cli_path_map(cls,value):
+        if set(value)-{'codex','claude'}:
+            raise ValueError('Only codex and claude CLI paths are supported')
+        for path in value.values():
+            if len(path)>4096:
+                raise ValueError('CLI path too long')
+            cls.absolute_path(path)
+        return value
+
+    @field_validator('idempotency_key')
+    @classmethod
+    def plain_key(cls,value):
+        if any(ord(char)<32 or ord(char)==127 for char in value):
+            raise ValueError('Control characters are not allowed')
+        return value
 class Attempt(Body):
     previous_runner_stopped: bool
 class Event(Body):
-    attempt: int = Field(ge=1,le=2)
+    attempt: int = Field(ge=0,le=2)
     event: Literal['progress','exit','failed']
     message: str = Field(default='',max_length=4096)
     exit_code: int | None = None
+
+    @model_validator(mode='after')
+    def preflight_failure_only(self):
+        if self.attempt==0 and self.event!='failed':
+            raise ValueError('Attempt zero only reports preflight failure')
+        return self
 
 def hashed(token):
     return hashlib.sha256(token.encode()).hexdigest()
@@ -60,6 +94,48 @@ CREATE TABLE IF NOT EXISTS helper_bootstrap_events(seq INTEGER PRIMARY KEY AUTOI
         except (OSError,ValueError,KeyError,TypeError):
             raise HTTPException(503,'Helper release is unavailable') from None
         return release
+    def signed_setup(self,release,model):
+        """Pin the deployment envelope; the launcher verifies its offline public-key signature."""
+        location=os.environ.get('HELPER_BOOTSTRAP_SIGNED_SETUP')
+        if location is None:
+            return None
+        try:
+            with Path(location).open('rb') as source:
+                raw=source.read(1024*1024+1)
+            if len(raw)>1024*1024:
+                raise ValueError('Envelope too large')
+            envelope=json.loads(raw)
+            if not isinstance(envelope,dict) or set(envelope)!={'payload','signature'}:
+                raise ValueError('Invalid envelope')
+            payload_raw=base64.b64decode(envelope['payload'],validate=True)
+            signature=base64.b64decode(envelope['signature'],validate=True)
+            if not signature or len(signature)>16384:
+                raise ValueError('Invalid signature encoding')
+            payload=json.loads(payload_raw.decode('utf-8'))
+            required={'schema','revision','issued_at','expires_at','model','release','model_catalog_sha256','install_instructions','reuse_instructions'}
+            if not isinstance(payload,dict) or not required.issubset(payload):
+                raise ValueError('Incomplete payload')
+            if type(payload['schema']) is not int or payload['schema']!=1:
+                raise ValueError('Unsupported schema')
+            revision=payload['revision']
+            if not ((type(revision) is int and revision>0) or (isinstance(revision,str) and 0<len(revision)<=128)):
+                raise ValueError('Invalid revision')
+            for key in ('issued_at','expires_at'):
+                if type(payload[key]) not in (int,float) or not math.isfinite(payload[key]):
+                    raise ValueError('Invalid timestamp')
+            if payload['expires_at']<=payload['issued_at'] or payload['expires_at']<=time.time() or payload['issued_at']>time.time()+300:
+                raise ValueError('Expired or future envelope')
+            if payload['release']!=release or payload['model']!=model:
+                raise ValueError('Deployment and envelope disagree')
+            if not isinstance(payload['model_catalog_sha256'],str) or not re.fullmatch('[0-9a-f]{64}',payload['model_catalog_sha256']):
+                raise ValueError('Invalid catalog digest')
+            for key in ('install_instructions','reuse_instructions'):
+                if not isinstance(payload[key],str) or not payload[key].strip():
+                    raise ValueError('Instructions missing')
+            return envelope
+        except (OSError,ValueError,TypeError,KeyError,UnicodeError,binascii.Error):
+            raise HTTPException(503,'Signed helper setup is unavailable or inconsistent') from None
+
     def row(self,db,device,sid):
         row=db.execute('SELECT * FROM helper_bootstrap_sessions WHERE id=? AND device_id=?',(sid,device)).fetchone()
         if row is None: raise HTTPException(404,'Setup session not found')
@@ -76,16 +152,15 @@ CREATE TABLE IF NOT EXISTS helper_bootstrap_events(seq INTEGER PRIMARY KEY AUTOI
         return {'helper_fresh':fresh, **{k:row[k] for k in ('id','status','attempt','provider','heartbeats','first_seen','last_seen','last_error','deadline')}} | {'release':doc['release'],'instructions_url':doc['origin']+'/api/device/helper-bootstrap/sessions/'+row['id']+'/instructions'}
     def create(self,device,data,origin):
         for key in ('installation_root','python','credential_file'):
-            if not Path(data[key]).is_absolute() or '\x00' in data[key]: raise HTTPException(422,'Absolute local paths required')
+            if not Path(data[key]).is_absolute() or any(ord(char)<32 or ord(char)==127 for char in data[key]): raise HTTPException(422,'Absolute local paths required')
         with self.store.db() as db:
             previous=db.execute('SELECT * FROM helper_bootstrap_sessions WHERE device_id=? AND idempotency_key=?',(device,data['idempotency_key'])).fetchone()
             if previous:return self.view(previous)
         release=self.release()
         sid=str(uuid.uuid4()); now=time.time()
         doc=dict(data,origin=origin,release=release,model=os.environ.get("HELPER_BOOTSTRAP_MODEL","abliterated-model-large-flash"))
-        extra_path=os.environ.get('HELPER_BOOTSTRAP_INSTRUCTIONS')
-        extra=Path(extra_path).read_text() if extra_path else ''
-        instructions=self.instructions(sid,doc)+'\n'+extra
+        doc['signed_setup']=self.signed_setup(release,doc['model'])
+        instructions=self.instructions(sid,doc)
         with self.store.db(True) as db:
             previous=db.execute('SELECT * FROM helper_bootstrap_sessions WHERE device_id=? AND idempotency_key=?',(device,data['idempotency_key'])).fetchone()
             if previous:return self.view(previous)
@@ -138,6 +213,8 @@ CREATE TABLE IF NOT EXISTS helper_bootstrap_events(seq INTEGER PRIMARY KEY AUTOI
         with self.store.db(True) as db:
             row=self.row(db,device,sid)
             if row['attempt']!=data['attempt']:raise HTTPException(409,'Stale attempt')
+            if data['attempt']==0 and (data['event']!='failed' or row['status']!='pending'):
+                raise HTTPException(409,'Only pending setup can report preflight failure')
             message=redact(data['message'])
             if data['event'] in ('failed','exit'):
                 if row['status']!='ready':
@@ -205,7 +282,8 @@ def install_routes(app,store,device):
     def instructions(sid:str,device_id=Depends(device)):
         with store.db() as db:
             row=service.row(db,device_id,sid)
-            return {'instructions':row['instructions'],'release':json.loads(row['document'])['release']}
+            document=json.loads(row['document'])
+            return {'instructions':row['instructions'],'release':document['release'],'signed_setup':document.get('signed_setup')}
     @app.post('/api/device/helper-bootstrap/sessions/{sid}/attempt')
     def attempt(sid:str,data:Attempt,device_id=Depends(device)):return service.attempt(device_id,sid,data.previous_runner_stopped)
     @app.post('/api/device/helper-bootstrap/sessions/{sid}/events')

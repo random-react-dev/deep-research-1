@@ -24,3 +24,13 @@ Failure tests and limits are described in verification-boundaries.md. Download d
 Final combined regression run: **173 passed**, three subtests passed, one dependency deprecation warning. Includes the actual Codex catalog/request fixture and download-fault fixtures. Earlier Rust unit and resumable-upload integration runs passed (7 and 8 tests respectively).
 
 Publication check: the repository is public and anonymously readable. The exact command `npx skills add random-react-dev/helper-runner` completed in an isolated project, discovered one skill, and installed exactly `SKILL.md` and `scripts/launch.py`. Both files match the published source.
+
+## Signed setup update
+
+Revision `2026.10.23.signed1` binds the reviewed setup/reuse instructions, release `.5` and model catalog with an offline RSA-3072/SHA-256 signing key. The private key was not uploaded or committed.
+
+Both real Codex and Claude runs verified the envelope before model startup, installed the unchanged helper package, reached server readiness on attempt one, and exited. Both helpers subsequently sent fresh heartbeats, launched their selected workers and returned `signed-setup.txt`; downloaded bytes matched `SIGNED_SETUP_OK\n`. Only the two test-owned services, directories and records were removed. All 19 original baseline hashes still match.
+
+Final regression result: **203 passed**, eight subtests passed; skill validation passed. Coverage includes real signature validation, tampering/wrong-key/expiry rejection, model/catalog mismatch, preflight failure without model startup, hostile ZIPs, linked destinations and interrupted downloads. Two warnings are a dependency deprecation and an intentionally duplicated hostile ZIP member.
+
+This machine's default Python 3.14 has a broken `plistlib` dependency. The launcher now detects that prerequisite failure clearly; live tests used the working Python 3.12 interpreter. No permission prompts were added. Unrestricted runner permissions and the model/proxy trust boundary remain unchanged.

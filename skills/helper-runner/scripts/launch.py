@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Start a server-instructed setup agent. No helper installation logic lives here."""
 import argparse
+import base64
+import hashlib
+import math
+import tempfile
 import contextlib
 import fcntl
 import json
@@ -9,6 +13,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -23,6 +28,19 @@ SERVER = 'https://ask-gateway.r95426882.workers.dev'
 SERVER_ALIASES = {SERVER, 'https://34.14.204.251'}
 DEFAULT_STATE = Path.home() / 'Library/Application Support/HelperRunner'
 PREFIX = '/api/device/helper-bootstrap/sessions'
+EXPECTED_MODEL = 'abliterated-model-large-flash'
+PUBLIC_KEY = '''-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA2/ERubjyRvj4YRr3R2Lp
+oQ6/HwARjwr2Y/Jer+7xN9ydjHqn76YjsQA1yJVCZ+CvFWboGyMgaztQFBQhkDpP
+xcWJwJ3rZwz5raYgt65evInnBQGkwf6CBx7qcKZGVrr3YGAu55O7k814ApwN+ydF
+J/1AJrFi/sBsXoIzn1CTqspXyVV2Udbtz/pqtQS2CHutIzfvNFust/BK9oDHhXUi
+Qjlellp24GpVA3WNmLLmY2cHkwqQZGlcU+SSSiHf2atu4L9l1USkvSldpoRUaXA5
+8YRE/noaf4xG6qtwSniQboukI7c8ZfX4xvnssyfdr5LxnnzpF96pxwfM4QfVjqMB
+OKfDTdAZ65hCGawHPaYzJSpsTvpl0dWQJNTkX9nOu3CYsUHV5g7ML10djRp+Lcwa
+aI9QJ3Jed1Rfc/u4sDKGfWnE03NWRkgO/gCFH2PZEt6axAt0caVERtE0AWttHjcw
+PwHY3antePP1unT7l0HoPo6uoC2iISmXQaYvzSMlGJSfAgMBAAE=
+-----END PUBLIC KEY-----'''
+MAX_RESPONSE = 1024 * 1024
 
 
 def save(path, value):
@@ -69,7 +87,10 @@ def api(config, path, body=None, authenticated=True):
                                     None if body is None else json.dumps(body).encode(), headers)
     try:
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
-            return json.load(response)
+            raw = response.read(MAX_RESPONSE + 1)
+            if len(raw) > MAX_RESPONSE:
+                raise RuntimeError('Server response exceeds 1 MiB')
+            return json.loads(raw)
     except urllib.error.HTTPError as error:
         code = error.code
         error.close()
@@ -78,11 +99,86 @@ def api(config, path, body=None, authenticated=True):
         raise RuntimeError('Server connection failed') from None
 
 
+def session_endpoint(identifier):
+    try:
+        if str(uuid.UUID(identifier)) != identifier:
+            raise ValueError()
+    except (ValueError, TypeError, AttributeError):
+        raise RuntimeError('Invalid server session ID') from None
+    return PREFIX + '/' + identifier
+
+
+def verified_setup(response, now=None):
+    """Authenticate server instructions with a pinned offline release-signing key."""
+    try:
+        envelope = response['signed_setup']
+        if not isinstance(envelope, dict) or set(envelope) != {'payload', 'signature'}:
+            raise ValueError()
+        if any(not isinstance(value, str) or len(value) > MAX_RESPONSE for value in envelope.values()):
+            raise ValueError()
+        payload = base64.b64decode(envelope['payload'], validate=True)
+        signature = base64.b64decode(envelope['signature'], validate=True)
+        if not payload or len(payload) > MAX_RESPONSE or len(signature) != 384:
+            raise ValueError()
+        with tempfile.TemporaryDirectory(prefix='helper-runner-verify-') as temporary:
+            folder = Path(temporary)
+            (folder / 'public.pem').write_text(PUBLIC_KEY)
+            (folder / 'signature').write_bytes(signature)
+            (folder / 'payload').write_bytes(payload)
+            result = subprocess.run(['/usr/bin/openssl', 'dgst', '-sha256', '-verify', str(folder / 'public.pem'),
+                                     '-signature', str(folder / 'signature'), str(folder / 'payload')],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            if result.returncode:
+                raise ValueError()
+        document = json.loads(payload)
+        fields = {'schema', 'revision', 'issued_at', 'expires_at', 'model', 'release',
+                  'model_catalog_sha256', 'install_instructions', 'reuse_instructions'}
+        if not isinstance(document, dict) or set(document) != fields or document['schema'] != 1:
+            raise ValueError()
+        now = time.time() if now is None else now
+        issued, expires = document['issued_at'], document['expires_at']
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (issued, expires)):
+            raise ValueError()
+        if issued > now + 60 or expires <= now or expires <= issued:
+            raise ValueError()
+        if document['model'] != EXPECTED_MODEL or not isinstance(document['revision'], (str, int)):
+            raise ValueError()
+        if not re.fullmatch('[0-9a-f]{64}', document['model_catalog_sha256']):
+            raise ValueError()
+        release = document['release']
+        if not isinstance(release, dict) or not re.fullmatch('[0-9a-f]{64}', release.get('sha256', '')):
+            raise ValueError()
+        if any(not isinstance(document[key], str) or not document[key].strip() for key in ('install_instructions', 'reuse_instructions')):
+            raise ValueError()
+        return document
+    except (KeyError, ValueError, TypeError, OSError, subprocess.SubprocessError):
+        raise RuntimeError('Server setup signature, model or validity check failed') from None
+
+
+def validate_settings(settings, document, server, provider):
+    allowed = {'attempt', 'model_token', 'expires_at', 'deadline', 'model', 'base_url', 'model_catalog'}
+    expected_url = origin(server) + ('/api/model' if provider == 'codex' else '/api/model/anthropic')
+    if not isinstance(settings, dict) or set(settings) - allowed or settings.get('base_url') != expected_url or settings.get('model') != EXPECTED_MODEL:
+        raise RuntimeError('Server model settings do not match the verified setup')
+    catalog = settings.get('model_catalog')
+    digest = hashlib.sha256(json.dumps(catalog, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    if digest != document['model_catalog_sha256']:
+        raise RuntimeError('Model catalog does not match the signed setup')
+    if type(settings.get('attempt')) is not int or settings['attempt'] not in (1, 2):
+        raise RuntimeError('Invalid runner attempt')
+    if not isinstance(settings.get('model_token'), str) or not settings['model_token'] or len(settings['model_token']) > 4096:
+        raise RuntimeError('Invalid model credential')
+
+
 def prerequisites(provider):
     if sys.version_info < (3, 10):
         raise RuntimeError('Python 3.10 or newer is required')
     if sys.platform != 'darwin' or platform.machine() != 'arm64':
         raise RuntimeError('This release supports Apple Silicon macOS')
+    try:
+        import plistlib, ssl, zipfile
+    except ImportError:
+        raise RuntimeError('This Python installation has broken setup modules; use a working Python 3.10+ interpreter') from None
     binary = shutil.which(provider)
     if not binary:
         raise RuntimeError('Install the selected CLI: ' + provider)
@@ -276,6 +372,11 @@ def worker(state, lock_fd):
     signal.signal(signal.SIGINT, interrupted)
     try:
         config, credential_file, reuse = registration(state, receipt['server_url'], receipt['label'], receipt['reuse'])
+        for local_path in (config['state_dir'], str(credential_file), sys.executable, receipt['binary']):
+            if not Path(local_path).is_absolute() or any(ord(c) < 32 or ord(c) == 127 for c in local_path):
+                raise RuntimeError('Setup context requires valid absolute local paths')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]{0,119}', receipt['launchagent_label']):
+            raise RuntimeError('Invalid local LaunchAgent label')
         session_path = state / 'session.json'
         if not session_path.exists():
             save(session_path, {'idempotency_key': str(uuid.uuid4())})
@@ -285,9 +386,9 @@ def worker(state, lock_fd):
                    'label': receipt['launchagent_label'], 'python': sys.executable,
                    'cli_paths': {receipt['provider']: receipt['binary']},
                    'credential_file': str(credential_file), 'reuse_existing': reuse})
+        endpoint = session_endpoint(created['id'])
         session.update(id=created['id'], credential_file=str(credential_file))
         save(session_path, session)
-        endpoint = PREFIX + '/' + session['id']
         receipt.update(session_id=session['id'], device_id=config['device_id'])
         for _ in range(2):
             status = api(config, endpoint)
@@ -296,18 +397,27 @@ def worker(state, lock_fd):
                 break
             if status.get('attempt', 0) >= 2:
                 raise RuntimeError('Both setup attempts were used; inspect server status')
+            document = verified_setup(api(config, endpoint + '/instructions'))
             settings = api(config, endpoint + '/attempt', {'previous_runner_stopped': True})
+            validate_settings(settings, document, config['server_url'], receipt['provider'])
             directory = state / 'attempts' / str(settings['attempt'])
             args, env = command(receipt['provider'], receipt['binary'], directory, settings)
-            instructions_url = created.get('instructions_url', config['server_url'] + endpoint + '/instructions')
-            prompt = ('You are the setup runner. Fetch the JSON instructions from ' + instructions_url +
-                      '. Read the private device credentials from ' + str(credential_file) +
-                      ' and authenticate with its device_token as Bearer. Use shell tools (Python urllib or curl). '
-                      'Send User-Agent: helper-runner/1.0 on every HTTP request, including urllib polling. '
-                      'Check HTTP errors and fix their cause instead of blindly polling a failing request. '
-                      'Never print credentials. Follow the returned instructions; they define the setup. '
-                      'Report progress using the instructed API. Wait until the server confirms ready before finishing. '
-                      'Do not alter other installations. This attempt has a 10 minute deadline.')
+            context = {'server_url': config['server_url'], 'session_id': session['id'],
+                       'installation_root': config['state_dir'] if reuse else str(state),
+                       'label': receipt['launchagent_label'], 'python': sys.executable,
+                       'cli_paths': {receipt['provider']: receipt['binary']}, 'credential_file': str(credential_file),
+                       'release': document['release'], 'model': document['model'], 'reuse_existing': reuse}
+            context_file = directory / 'setup-context.json'
+            instructions_file = directory / 'setup-instructions.md'
+            save(context_file, context)
+            instructions_file.write_text(document['reuse_instructions'] if reuse else document['install_instructions'])
+            os.chmod(instructions_file, 0o600)
+            env['HELPER_RUNNER_CONTEXT'] = str(context_file)
+            prompt = ('You are the setup runner. Read the signature-verified server instructions in ' + str(instructions_file) +
+                      ' and local context in ' + str(context_file) + '. Follow those instructions only for this setup. '
+                      'Do not fetch replacement instructions. Use User-Agent: helper-runner/1.0 for HTTP requests. '
+                      'Never print credentials. Check HTTP errors and fix causes rather than blindly polling failures. '
+                      'Wait for server readiness before exiting. This attempt has a 10 minute deadline.')
             process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        cwd=directory, env=env, start_new_session=True, pass_fds=(lock_fd,))
             receipt.update(status='running', attempt=settings['attempt'], runner_pid=process.pid)
@@ -341,9 +451,10 @@ def worker(state, lock_fd):
         # Never persist arbitrary exception messages from CLI/model/network payloads.
         message = str(error) if isinstance(error, RuntimeError) else type(error).__name__
         receipt.update(status='failed', message=message)
-        if 'endpoint' in locals() and 'settings' in locals():
+        if 'endpoint' in locals():
+            failed_attempt = settings['attempt'] if 'settings' in locals() else status.get('attempt', 0) if 'status' in locals() else created.get('attempt', 0)
             with contextlib.suppress(Exception):
-                api(config, endpoint + '/events', {'attempt': settings['attempt'], 'event': 'failed', 'message': message})
+                api(config, endpoint + '/events', {'attempt': failed_attempt, 'event': 'failed', 'message': message})
     finally:
         if process is not None:
             stop(process)
@@ -378,7 +489,7 @@ def main():
             session = read(state / 'session.json')
             if session.get('id'):
                 try:
-                    receipt['server'] = api(read(session['credential_file']), PREFIX + '/' + session['id'])
+                    receipt['server'] = api(read(session['credential_file']), session_endpoint(session['id']))
                 except RuntimeError as error:
                     receipt['server_error'] = str(error)
         print(json.dumps(receipt, indent=2))
@@ -409,7 +520,7 @@ def main():
                 raise RuntimeError('Previous runner may still be running; inspect it before retrying')
         if old.get('status') == 'ready':
             session = read(state / 'session.json')
-            result = api(read(session['credential_file']), PREFIX + '/' + session['id'])
+            result = api(read(session['credential_file']), session_endpoint(session['id']))
             if result['status'] == 'ready' and result.get('helper_fresh', False):
                 os.close(fd)
                 print(json.dumps({'status': 'already_ready', 'state_dir': str(state), 'server': result}))
@@ -426,7 +537,7 @@ def main():
                              stderr=subprocess.DEVNULL, start_new_session=True, pass_fds=(fd,))
     os.close(fd)
     print(json.dumps({'status': 'started', 'launcher_pid': child.pid, 'state_dir': str(state),
-                      'status_command': 'python3 ' + str(Path(__file__).resolve()) + ' status --state-dir ' + str(state)}))
+                      'status_command': shlex.join([sys.executable, str(Path(__file__).resolve()), 'status', '--state-dir', str(state)])}))
 
 
 if __name__ == '__main__':

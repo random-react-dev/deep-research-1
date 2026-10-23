@@ -1,5 +1,15 @@
 # Testing helper-runner
 
+## Signed setup instructions
+
+`server/setup-install.md` and `server/setup-reuse.md` are reviewed, static server instructions. The runner reads only its validated `HELPER_RUNNER_CONTEXT` file for machine-specific values. Installation uses a bounded, no-redirect Python download and verifies the signed archive SHA-256 before any extraction. This supersedes the earlier curl/unzip instruction pattern described in historical tests below.
+
+The extraction block checks the exact signed manifest, member hashes and sizes, a 32-member/128 MiB expanded bound, safe relative paths and regular-file types. It rejects duplicate names, symlinks, special files, unsupported ZIP metadata and linked destination files/parents. Existing differing files are preserved by failing rather than overwriting. The reuse template only polls status.
+
+`tools/sign_setup.py` is a development-only signing tool. Supply `--key`, `--release`, `--models`, `--install`, `--reuse`, `--revision` and `--output`; optional `--expiry-days` defaults to 90. It signs canonical ASCII JSON using OpenSSL RSA-SHA256 and writes a base64 payload/signature envelope. Generate and store the private key separately; do not commit it. The launcher pins only the public verification key. The tool refuses to overwrite a different envelope.
+
+Seven signed-asset tests passed using the development Python 3.12 environment, including extraction of the actual `.5` release, hostile archive cases, partial-response retry, RSA signature verification and immutable output. These tests never load a LaunchAgent. The local Python 3.14 installation failed to import `plistlib` because its `pyexpat` dynamic library was incompatible with the system libexpat; use the verified Python 3.12 interpreter for the setup context on this test machine.
+
 ## Current release: lowest thinking
 
 Version `2026.10.23.5` supersedes `.4`. Build it with `--model-profile abliteration --patch-tool none`. Its SHA-256 is `25d288ab7492b40566c4fa8392cc4acf64619f8ffdb70760d8162b96cfd65e45` (398,361 bytes). Codex catalog defaults to `none` and advertises only `none`; the packaged runtime explicitly uses reasoning `none`. Claude gets `alwaysThinkingEnabled:false`, `MAX_THINKING_TOKENS=0`, and `--effort low`. The server must also enforce disabled thinking for a third-party provider that treats omission as its own default. Existing source files remain unchanged.

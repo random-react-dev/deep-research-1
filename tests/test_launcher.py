@@ -90,13 +90,13 @@ class LauncherTests(unittest.TestCase):
             config = {'server_url': 'https://example.com', 'device_id': 'device', 'device_token': 'token', 'state_dir': directory}
             def request(config, path, body=None, authenticated=True):
                 if path == launcher.PREFIX:
-                    return {'id': 'session', 'instructions_url': 'https://example.com/instructions'}
+                    return {'id': '11111111-1111-4111-8111-111111111111', 'instructions_url': 'https://example.com/instructions'}
                 if path.endswith('/attempt'):
                     attempts.append(1)
                     return {'attempt': len(attempts), 'model': 'm', 'model_token': 't', 'base_url': 'https://example.com'}
                 return {'status': 'pending', 'attempt': len(attempts)}
             fd = os.open(state / 'lock', os.O_CREAT | os.O_RDWR, 0o600)
-            with patch.object(launcher, 'registration', return_value=(config, state / 'device.json', False)), patch.object(launcher, 'api', side_effect=request), patch.object(launcher, 'command', side_effect=lambda provider, binary, folder, settings: (folder.mkdir(parents=True, exist_ok=True) or [sys.executable, '-c', 'import sys; sys.stdin.read(); print("{}")'], os.environ.copy())):
+            with patch.object(launcher, 'registration', return_value=(config, state / 'device.json', False)), patch.object(launcher, 'api', side_effect=request), patch.object(launcher, 'verified_setup', return_value={'release': {}, 'model': launcher.EXPECTED_MODEL, 'install_instructions':'test', 'reuse_instructions':'test'}), patch.object(launcher, 'validate_settings'), patch.object(launcher, 'command', side_effect=lambda provider, binary, folder, settings: (folder.mkdir(parents=True, exist_ok=True) or [sys.executable, '-c', 'import sys; sys.stdin.read(); print("{}")'], os.environ.copy())):
                 launcher.worker(state, fd)
             self.assertEqual(len(attempts), 2)
             self.assertEqual(launcher.read(state / 'receipt.json')['status'], 'failed')
@@ -189,6 +189,99 @@ class LauncherTests(unittest.TestCase):
             self.assertGreater(request.call_count, 1)
         finally:
             launcher.stop(process)
+
+    def test_status_command_preserves_interpreter_and_space_paths(self):
+        import shlex
+        with tempfile.TemporaryDirectory(prefix='helper runner ') as directory:
+            output = io.StringIO()
+            with patch.object(launcher, 'prerequisites', return_value=sys.executable), patch.object(launcher.subprocess, 'Popen') as spawn, patch.object(sys, 'argv', [str(SCRIPT), 'start', '--state-dir', directory]), patch('sys.stdout', output):
+                spawn.return_value.pid = 123
+                launcher.main()
+            result = json.loads(output.getvalue())
+            self.assertEqual(shlex.split(result['status_command']), [sys.executable, str(SCRIPT.resolve()), 'status', '--state-dir', str(Path(directory).resolve())])
+
+
+class SignedSetupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import base64
+        cls.folder = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.folder.name)
+        cls.key = cls.root / 'private.pem'
+        subprocess.run(['/usr/bin/openssl', 'genrsa', '-out', str(cls.key), '3072'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cls.public = subprocess.check_output(['/usr/bin/openssl', 'rsa', '-in', str(cls.key), '-pubout'], stderr=subprocess.DEVNULL).decode()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.folder.cleanup()
+
+    def signed(self, **changes):
+        import base64, hashlib
+        document = {'schema':1,'revision':'test','issued_at':100,'expires_at':200,
+                    'model':launcher.EXPECTED_MODEL,'release':{'sha256':'a'*64},
+                    'model_catalog_sha256':hashlib.sha256(b'{"models":[]}').hexdigest(),
+                    'install_instructions':'Install the signed release.','reuse_instructions':'Verify the existing helper.'}
+        document.update(changes)
+        payload = json.dumps(document).encode()
+        source = self.root / 'payload'
+        source.write_bytes(payload)
+        signature = subprocess.check_output(['/usr/bin/openssl', 'dgst', '-sha256', '-sign', str(self.key), str(source)])
+        return {'signed_setup':{'payload':base64.b64encode(payload).decode(), 'signature':base64.b64encode(signature).decode()}}, document
+
+    def test_real_openssl_signature_and_tamper_rejection(self):
+        import base64
+        envelope, document = self.signed()
+        with patch.object(launcher, 'PUBLIC_KEY', self.public):
+            self.assertEqual(launcher.verified_setup(envelope, now=150), document)
+            envelope['signed_setup']['payload'] = base64.b64encode(b'{}').decode()
+            with self.assertRaises(RuntimeError): launcher.verified_setup(envelope, now=150)
+
+    def test_wrong_key_expired_and_unexpected_model(self):
+        envelope, _ = self.signed()
+        with self.assertRaises(RuntimeError): launcher.verified_setup(envelope, now=150)
+        with patch.object(launcher, 'PUBLIC_KEY', self.public):
+            with self.assertRaises(RuntimeError): launcher.verified_setup(envelope, now=201)
+            wrong_model, _ = self.signed(model='another-model')
+            with self.assertRaises(RuntimeError): launcher.verified_setup(wrong_model, now=150)
+
+    def test_catalog_and_crosshost_settings_rejected(self):
+        _, document = self.signed()
+        settings = {'attempt':1,'model_token':'secret','model':launcher.EXPECTED_MODEL,
+                    'base_url':'https://example.com/api/model','model_catalog':{'models':[]}}
+        launcher.validate_settings(settings, document, 'https://example.com', 'codex')
+        for changed in ({'base_url':'https://other.example/api/model'}, {'model_catalog':{'models':['injected']}}, {'model':'other'}, {'unexpected':'value'}):
+            with self.assertRaises(RuntimeError): launcher.validate_settings({**settings, **changed}, document, 'https://example.com', 'codex')
+
+    def test_session_id_cannot_inject_url(self):
+        for identifier in ('../instructions', 'https://other.example/x', 'not-a-uuid'):
+            with self.assertRaises(RuntimeError): launcher.session_endpoint(identifier)
+
+    def test_tamper_reports_attempt_zero_without_model_start(self):
+        import base64
+        envelope, _ = self.signed()
+        envelope['signed_setup']['payload'] = base64.b64encode(b'{}').decode()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            launcher.save(state / 'receipt.json', {'server_url':'https://example.com', 'label':'test', 'reuse':False,
+                          'provider':'codex', 'binary':sys.executable, 'launchagent_label':'test'})
+            config = {'server_url':'https://example.com', 'device_id':'device', 'device_token':'token', 'state_dir':directory}
+            calls = []
+            def request(config, path, body=None, authenticated=True):
+                calls.append((path, body))
+                if path == launcher.PREFIX:
+                    return {'id':'11111111-1111-4111-8111-111111111111', 'attempt':0}
+                if path.endswith('/instructions'):
+                    return envelope
+                return {'status':'pending', 'attempt':0}
+            fd = os.open(state / 'lock', os.O_CREAT | os.O_RDWR, 0o600)
+            with patch.object(launcher, 'registration', return_value=(config, state / 'device.json', False)), patch.object(launcher, 'api', side_effect=request), patch.object(launcher, 'PUBLIC_KEY', self.public), patch.object(launcher, 'command') as build_command:
+                launcher.worker(state, fd)
+                build_command.assert_not_called()
+            self.assertFalse(any(path.endswith('/attempt') for path, _ in calls))
+            failed = [body for path, body in calls if path.endswith('/events')]
+            self.assertEqual(len(failed), 1)
+            self.assertEqual((failed[0]['attempt'], failed[0]['event']), (0, 'failed'))
+            self.assertEqual(launcher.read(state / 'receipt.json')['status'], 'failed')
 
 
 if __name__ == '__main__':

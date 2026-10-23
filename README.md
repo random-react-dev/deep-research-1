@@ -24,7 +24,7 @@ Use `--provider claude` for Claude. The default server is `https://ask-gateway.r
 
 The default private state folder is `~/Library/Application Support/HelperRunner`. The helper installs once per Mac. A healthy compatible existing device installation is reused and verified without overwriting it.
 
-The launcher handles connection, process startup, status and one retry. It checks server readiness every five seconds. After verified readiness, the runner has 30 seconds to exit naturally before the launcher stops its own runner process; the independent helper keeps running. It does not download, unpack or install the helper. The server gives those instructions to the runner. `task_agent.py` is server-distributed support for later work, not part of this skill's setup launcher.
+The launcher handles connection, signature verification, process startup, status and one retry. It derives the instructions URL from the configured server and session ID, verifies the server envelope with its bundled public key, and gives the runner a private local snapshot. Installation paths come from local context; the model catalog must match its signed checksum. It checks server readiness every five seconds. After verified readiness, the runner has 30 seconds to exit naturally before the launcher stops its own runner process; the independent helper keeps running. It does not download, unpack or install the helper. The server gives those instructions to the runner. `task_agent.py` is server-distributed support for later work, not part of this skill's setup launcher.
 
 ## Isolated testing
 
@@ -62,9 +62,9 @@ Configure the following server environment values:
 - `HELPER_BOOTSTRAP_MODELS`: path to the new release's Abliteration Codex catalog, not the old DeepSeek catalog.
 - `HELPER_BOOTSTRAP_MODEL=abliterated-model-large-flash`.
 - `ABLITERATION_API_KEY`: private server environment only; never place it in the skill or repository.
-- Optional `HELPER_BOOTSTRAP_INSTRUCTIONS`: text file whose content is appended and pinned when each new setup session is created.
+- `HELPER_BOOTSTRAP_SIGNED_SETUP`: private deployment path to the signed setup envelope. New sessions pin this envelope; the launcher verifies its RSA-SHA256 signature against its bundled public key before giving instructions to the runner. No arbitrary extra-instructions file is appended. A configured missing, malformed, expired or release/model-mismatched envelope fails closed with HTTP 503. Existing session snapshots remain unchanged.
 
-The existing server database/admin secret configuration remains required. HTTPS must forward public release downloads, authenticated `/api/device/helper-bootstrap/` requests, and native `/api/model/` requests. Registration uses the server's existing enrollment flow. Keep existing DeepSeek credentials if old devices still use that provider.
+The existing server database and device authentication configuration remain required. HTTPS must forward public release downloads, authenticated `/api/device/helper-bootstrap/` requests, and native `/api/model/` requests. Registration uses the server's existing enrollment flow. Keep existing DeepSeek credentials if old devices still use that provider.
 
 Build releases with `tools/build_release.py --help`; the build requires a matching existing helper binary and worker runtime source. Deploy the new module, hooks, release and catalog before making the skill available to users. This integration adds SQLite tables on startup; old endpoints and clients remain supported.
 
@@ -80,3 +80,20 @@ See [verification boundaries](docs/verification-boundaries.md) for the distincti
 ## Verified release
 
 Both Codex and Claude completed real setup, exited after verified helper heartbeats, and subsequently completed helper-launched tasks. A 12 MiB background upload was downloaded and checked byte-for-byte. See [acceptance results](docs/live-acceptance.md) and [test boundaries](docs/verification-boundaries.md). A full Mac reboot has not been tested.
+
+## Signed setup maintenance
+
+The server holds signed public instructions, not the private signing key. Review `server/setup-install.md` and `server/setup-reuse.md` before signing. `tools/sign_setup.py` binds both templates, the exact release manifest and model catalog into one RSA-3072/SHA-256 signed envelope. The launcher uses macOS `/usr/bin/openssl`; no extra Python package or approval prompt is required.
+
+```sh
+python3 tools/sign_setup.py --key /private/path/setup-signing.pem \
+  --release /path/current.json --models /path/models.json \
+  --install server/setup-install.md --reuse server/setup-reuse.md \
+  --revision YOUR_REVIEWED_REVISION --output /path/signed-setup.json
+```
+
+Upload only the resulting envelope. Point `HELPER_BOOTSTRAP_SIGNED_SETUP` to it, restart the server, and test a fresh session before publishing a client change. The default signature validity is 90 days; renew it before expiry. Existing installed helpers do not require a new setup when the envelope expires. Changing the public key requires a skill update. Keep a private backup of the signing key outside Git and off the live server.
+
+The signed template checks archive/member hashes, fixed download paths, bounds, duplicate entries and unsafe paths/links before extraction. It refuses to overwrite differing installation files. Arbitrary extra server instruction text is no longer supported.
+
+These checks authenticate the reviewed instructions and package; they do not sandbox the runner. Unattended shell permissions are unchanged. The model/proxy, local account and signing process remain trusted, and no lower third-party audit rating is promised. Older installed launcher versions do not gain these checks until updated.
