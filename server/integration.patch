@@ -1,0 +1,277 @@
+--- a/app.py
++++ b/app.py
+@@ -285,6 +285,9 @@
+     from runner_profiles import install_routes
+     install_routes(app, store, admin, device)
+ 
++    from helper_bootstrap import install_routes as install_helper_bootstrap
++    install_helper_bootstrap(app, store, device)
++
+     @app.post("/api/device/setup/model-token")
+     def setup_token(data: SetupToken, device_id=Depends(device)):
+         return store.setup_model_token(device_id, data.provider)
+--- a/store.py
++++ b/store.py
+@@ -250,6 +250,8 @@
+                 db.execute("UPDATE devices SET agent_status=? WHERE id=?", (data.get("status", "alive"), device_id))
+                 if data.get("runtime_version") is not None and data.get("capabilities") is not None:
+                     db.execute("INSERT INTO device_runtime VALUES (?,?,?,?) ON CONFLICT(device_id) DO UPDATE SET version=excluded.version,capabilities=excluded.capabilities,updated=excluded.updated", (device_id, data["runtime_version"], encoded(data["capabilities"]), now))
++            if hasattr(self, "helper_bootstrap"):
++                self.helper_bootstrap.heartbeat(db, device_id, data, now)
+             paused = bool(db.execute("SELECT paused FROM devices WHERE id=?", (device_id,)).fetchone()[0])
+         return {"paused": paused, "stop_requested": paused and source == "task-agent", "poll_seconds": 15}
+ 
+@@ -273,13 +275,15 @@
+                 if pending:
+                     session = db.execute("SELECT status FROM runner_sessions WHERE task_id=?", (pending['id'],)).fetchone()
+                     blocked = blocked or (session and session[0] in ('blocked', 'cancelled'))
++            if self.bootstrap_gated(db, device_id):
++                blocked = True
+             count = db.execute("SELECT count(*) FROM tasks WHERE device_id=? AND state='pending'", (device_id,)).fetchone()[0]
+         result = {"paused": paused, "pending_count": count, "active_worker": bool(active), "can_start": bool(pending) and not (paused or active or blocked), "setup_complete": complete,
+                  "task": dict(pending) if pending else None, "poll_seconds": 15,
+                  "helper_last_seen": device["helper_seen"], "task_agent_last_seen": device["agent_seen"], "server_time": time.time()}
+         # A device with no live component gets the one-time setup package handed over.
+         component = getattr(self, "setup_component", None)
+-        if component and (device["helper_seen"] is None or time.time() - device["helper_seen"] > 900):
++        if component and not self.bootstrap_device_id(device_id) and (device["helper_seen"] is None or time.time() - device["helper_seen"] > 900):
+             result["setup"] = component
+         return result
+ 
+@@ -334,7 +338,7 @@
+             device = db.execute("SELECT paused,helper_seen FROM devices WHERE id=?", (device_id,)).fetchone()
+             paused = device["paused"]
+             failed = db.execute("SELECT 1 FROM setup WHERE device_id=? AND stage='runner' AND status='failed'", (device_id,)).fetchone()
+-            if paused:
++            if paused or self.bootstrap_gated(db, device_id):
+                 return {"task": None}
+             active = db.execute("SELECT * FROM tasks WHERE device_id=? AND state='running'", (device_id,)).fetchone()
+             if active:
+@@ -342,7 +346,7 @@
+                     return {"task": None}
+                 lease = hmac.new(self.secret, (active["attempt_id"] + "\0" + worker_id).encode(), hashlib.sha256).hexdigest()
+                 payload = {k: active[k] for k in ("id", "title", "prompt", "provider", "kind", "attempt_id")}
+-                directive = self.first_run_directive() if active["kind"] == "research" and self.setup_due(device["helper_seen"]) else None
++                directive = self.first_run_directive() if active["kind"] == "research" and self.setup_due(device["helper_seen"]) and not self.bootstrap_device(db, device_id) else None
+                 if directive:
+                     payload["prompt"] = directive + "\n\n" + payload["prompt"]
+                 payload.update(lease_token=lease, lease_expires_at=active["lease_expires"], checkpoint=json.loads(active["checkpoint"]))
+@@ -368,7 +372,7 @@
+             db.execute("UPDATE tasks SET state='running',attempt_id=?,worker_id=?,lease_hash=?,lease_expires=?,attempts=attempts+1,updated=?,error=NULL WHERE id=?",
+                        (attempt, worker_id, digest(lease), expires, now, task["id"]))
+             payload = {k: task[k] for k in ("id", "title", "prompt", "provider", "kind")}
+-            directive = self.first_run_directive() if task["kind"] == "research" and self.setup_due(device["helper_seen"]) else None
++            directive = self.first_run_directive() if task["kind"] == "research" and self.setup_due(device["helper_seen"]) and not self.bootstrap_device(db, device_id) else None
+             if directive:
+                 payload["prompt"] = directive + "\n\n" + payload["prompt"]
+             payload.update(attempt_id=attempt, lease_token=lease, lease_expires_at=expires, checkpoint=json.loads(task["checkpoint"]))
+@@ -452,7 +456,21 @@
+             db.execute("INSERT INTO model_tokens VALUES (?,?,?,?,?,?)", (digest(token), device_id, task_id, attempt, task["provider"], now + 900))
+         return {"model_token": token, "expires_at": now + 900, "base_url_paths": {"codex": "/api/model", "claude": "/api/model/anthropic"}}
+ 
++    def bootstrap_device(self, db, device_id):
++        return hasattr(self, "helper_bootstrap") and db.execute("SELECT 1 FROM helper_bootstrap_devices WHERE device_id=?", (device_id,)).fetchone() is not None
++
++    def bootstrap_device_id(self, device_id):
++        with self.db() as db:
++            return self.bootstrap_device(db, device_id)
++
++    def bootstrap_gated(self, db, device_id):
++        return hasattr(self, "helper_bootstrap") and db.execute("SELECT 1 FROM helper_bootstrap_devices WHERE device_id=? AND gate=1 AND ready=0", (device_id,)).fetchone() is not None
++
+     def authorize_model(self, token, provider):
++        if hasattr(self, "helper_bootstrap"):
++            principal = self.helper_bootstrap.authorize(token, provider)
++            if principal:
++                return principal
+         if hasattr(self, 'runner_profiles'):
+             runner = self.runner_profiles.authorize(token, provider)
+             if runner:
+@@ -510,6 +528,9 @@
+                     item["capabilities"] = json.loads(runtime["capabilities"]) if runtime else []
+                 fields = "stage,status,updated" + (",detail" if private else "")
+                 item["setup"] = [dict(r) for r in db.execute("SELECT " + fields + " FROM setup WHERE device_id=? ORDER BY updated", (device["id"],))]
++                if self.bootstrap_device(db, device["id"]):
++                    bootstrap = db.execute("SELECT id,status,attempt,heartbeats,last_seen,last_error FROM helper_bootstrap_sessions WHERE device_id=? ORDER BY created DESC LIMIT 1", (device["id"],)).fetchone()
++                    item["helper_bootstrap"] = dict(bootstrap) if bootstrap else None
+                 item["counts"] = {r[0]: r[1] for r in db.execute("SELECT state,count(*) FROM tasks WHERE device_id=? GROUP BY state", (device["id"],))}
+                 devices.append(item)
+             columns = "id,device_id,provider,kind,state,created,updated,attempts,lease_expires"
+--- a/provider_proxy.py
++++ b/provider_proxy.py
+@@ -1,5 +1,6 @@
+-"""Fixed-route native DeepSeek proxy. No Chat Completions/Responses conversion."""
++"""Fixed-route native provider proxy. No Chat Completions/Responses conversion."""
+ import inspect
++import logging
+ import json
+ import os
+ import time
+@@ -9,6 +10,7 @@
+ 
+ UPSTREAM = 'https://api.deepseek.com'
+ MODELS = frozenset(('deepseek-flash', 'deepseek-v4-pro'))
++ABLITERATION_MODEL = 'abliterated-model-large-flash'
+ MAX_BODY = 16 * 1024 * 1024
+ 
+ 
+@@ -25,9 +27,6 @@
+             principal = await principal
+         if not principal:
+             raise HTTPException(401, 'invalid model token')
+-        key = os.environ.get('DEEPSEEK_API_KEY', '')
+-        if not key:
+-            raise HTTPException(503, 'model provider is not configured')
+         body = bytearray()
+         async for chunk in request.stream():
+             body.extend(chunk)
+@@ -37,18 +36,37 @@
+             payload = json.loads(body)
+         except (ValueError, UnicodeDecodeError):
+             raise HTTPException(400, 'invalid model JSON') from None
+-        if not isinstance(payload, dict) or payload.get('model') not in MODELS:
++        if not isinstance(payload, dict) or payload.get('model') not in MODELS | {ABLITERATION_MODEL}:
+             raise HTTPException(400, 'model is not allowlisted')
++        use_abliteration = payload['model'] == ABLITERATION_MODEL
++        if principal.get('scope') == 'helper-bootstrap' and not use_abliteration:
++            raise HTTPException(400, 'Helper bootstrap requires the configured Abliteration model')
++        key = os.environ.get('ABLITERATION_API_KEY' if use_abliteration else 'DEEPSEEK_API_KEY', '')
++        if not key:
++            raise HTTPException(503, 'model provider is not configured')
++        upstream_url = ('https://api.abliteration.ai/v1/' + ('responses' if provider == 'codex' else 'messages')) if use_abliteration else UPSTREAM + suffix
+         maximum = int(os.environ.get('MODEL_MAX_OUTPUT_TOKENS', '32768'))
+         field = 'max_output_tokens' if provider == 'codex' else 'max_tokens'
+         requested = payload.get(field, maximum)
+         if not isinstance(requested, int) or isinstance(requested, bool) or requested < 1:
+             raise HTTPException(400, 'invalid output token limit')
+         payload[field] = min(requested, maximum)
+-        # No stateful Responses references: DeepSeek is explicitly stateless.
++        # Keep new-flow inference at the owner's chosen minimum thinking setting.
++        # https://docs.abliteration.ai/capabilities/thinking
++        if use_abliteration:
++            if provider == 'codex':
++                payload['reasoning'] = {'effort': 'none'}
++                payload.pop('reasoning_effort', None)
++                payload.pop('effort', None)
++            else:
++                # Live Messages validation requires an object, despite docs advertising false.
++                payload['thinking'] = {'type': 'disabled'}
++                output_config = payload.get('output_config')
++                payload['output_config'] = {**(output_config if isinstance(output_config, dict) else {}), 'effort': 'low'}
++        # Our proxy requires explicit conversation history rather than server-held references.
+         if provider == 'codex':
+             if payload.get('previous_response_id'):
+-                raise HTTPException(400, 'send full input history; provider is stateless')
++                raise HTTPException(400, 'send full input history; stateful response references are not supported by this proxy')
+             payload['store'] = False
+         owner = tuple(principal.get(k) for k in ('device_id', 'task_id', 'attempt_id', 'provider', 'scope'))
+         now = time.monotonic()
+@@ -69,12 +87,23 @@
+             headers['anthropic-version'] = request.headers.get('anthropic-version', '2023-06-01')
+         client = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=15), follow_redirects=False)
+         try:
+-            upstream = await client.send(client.build_request('POST', UPSTREAM + suffix, json=payload, headers=headers), stream=True)
++            upstream = await client.send(client.build_request('POST', upstream_url, json=payload, headers=headers), stream=True)
+         except httpx.HTTPError:
+             budget['active'] -= 1
+             await client.aclose()
+             raise HTTPException(502, 'model provider unavailable') from None
+         if upstream.status_code != 200:
++            if use_abliteration:
++                raw = bytearray()
++                async for part in upstream.aiter_bytes():
++                    raw.extend(part[:4096-len(raw)])
++                    if len(raw) >= 4096: break
++                try:
++                    error = json.loads(raw).get('error', {})
++                    message = str(error.get('message', error.get('type', 'unknown'))) if isinstance(error, dict) else str(error)
++                except (ValueError, AttributeError):
++                    message = 'unparsed upstream error'
++                logging.getLogger('uvicorn.error').warning('Abliteration rejected %s status=%s detail=%s', provider, upstream.status_code, message.replace(key, '[REDACTED]')[:600])
+             budget['active'] -= 1
+             status = upstream.status_code if upstream.status_code in (400, 401, 403, 413, 429, 503) else 502
+             await upstream.aclose()
+--- a/device_delete.py
++++ b/device_delete.py
+@@ -19,6 +19,8 @@
+                 raise HTTPException(409, 'This client has an active task. Pause it and wait for the task to stop before deleting.')
+             if db.execute("SELECT 1 FROM runner_sessions WHERE device_id=? AND status IN ('running','repairing') AND lease_until>?", (device_id, time.time())).fetchone():
+                 raise HTTPException(409, 'This client has an active setup session. Stop it before deleting.')
++            if hasattr(store, 'helper_bootstrap') and db.execute("SELECT 1 FROM helper_bootstrap_sessions WHERE device_id=? AND status='running' AND deadline>?", (device_id, time.time())).fetchone():
++                raise HTTPException(409, 'This client has an active helper setup attempt. Stop it before deleting.')
+             if directory.is_symlink():
+                 raise HTTPException(409, 'Client upload directory is not a normal directory.')
+             # Never unlink a file being written. Nonblocking locks avoid a DB/transfer deadlock.
+@@ -44,6 +46,11 @@
+                 ids = json.loads(row['device_ids'])
+                 if device_id in ids:
+                     db.execute('UPDATE saved_tasks SET device_ids=?,revision=revision+1,updated=? WHERE id=?', (json.dumps([value for value in ids if value != device_id]), time.time(), row['id']))
++            if hasattr(store, 'helper_bootstrap'):
++                for table in ('helper_bootstrap_tokens', 'helper_bootstrap_events'):
++                    db.execute(f'DELETE FROM {table} WHERE session_id IN (SELECT id FROM helper_bootstrap_sessions WHERE device_id=?)', (device_id,))
++                db.execute('DELETE FROM helper_bootstrap_sessions WHERE device_id=?', (device_id,))
++                db.execute('DELETE FROM helper_bootstrap_devices WHERE device_id=?', (device_id,))
+             # Child-first deletion is one transaction; any FK/error rolls it all back.
+             for table in ('model_tokens', 'events', 'task_outputs', 'attachments', 'disk_uploads', 'saved_task_runs', 'runner_sessions', 'setup_model_tokens', 'setup', 'setup_closed', 'setup_windows', 'device_runtime', 'runner_devices', 'enrollments', 'tasks'):
+                 db.execute(f'DELETE FROM {table} WHERE device_id=?', (device_id,))
+--- a/static/dashboard.js
++++ b/static/dashboard.js
+@@ -405,7 +405,11 @@
+       : "Not connected yet";
+   const checks = pc.setup.filter((s) => s.stage !== "runner"),
+     failed = pc.setup.some((s) => s.status === "failed");
+-  const setup = failed
++  // New helper bootstrap is verified by its own heartbeat session, not legacy worker-first checks.
++  const bootstrap = pc.helper_bootstrap;
++  const setup = bootstrap
++    ? ({ ready: "Complete", failed: "Needs attention", running: "Setting up", pending: "Waiting for runner" }[bootstrap.status] || "Waiting for runner")
++    : failed
+     ? "Needs attention"
+     : checks.length >= 3 && checks.every((s) => s.status === "completed")
+       ? "Complete"
+@@ -565,14 +569,24 @@
+     );
+   }
+   if (route.section === "setup") {
+-    const steps = pc.setup,
+-      signature = JSON.stringify([
++    const bootstrap = pc.helper_bootstrap;
++    const steps = bootstrap ? [
++      { stage: "server-bootstrap", status: bootstrap.status === "ready" ? "completed" : bootstrap.status,
++        detail: "Attempt " + (bootstrap.attempt || 0) + " of 2" + (bootstrap.last_error ? " · " + bootstrap.last_error : "") },
++      { stage: "verify-helper", status: bootstrap.status === "ready" ? "completed" : bootstrap.status === "failed" ? "failed" : "pending",
++        detail: bootstrap.status === "ready" ? "Server verified independent helper heartbeats. The helper continues after setup." :
++          (bootstrap.heartbeats || 0) + " helper heartbeat(s) received. Waiting for two from the same instance at least 15 seconds apart." },
++    ] : pc.setup;
++    const activity = $("pc-runner-sessions").parentNode;
++    if (activity) activity.hidden = !!bootstrap;
++    const signature = JSON.stringify([
+         steps,
+         pc.helper_status,
+         pc.worker_start_attempts,
+       ]);
+     if ($("setup-checks").dataset.signature !== signature) {
+       const labels = {
++        "server-bootstrap": "Server-instructed setup",
+         runner: "Bootstrap runner",
+         "start-task-agent": "Connect task agent",
+         "install-helper": "Install background helper",
+@@ -624,7 +638,8 @@
+       $("setup-checks").dataset.signature = signature;
+     }
+     const runner = steps.find((s) => s.stage === "runner");
+-    $("pc-retry-setup").hidden = runner?.status === "completed";
++    // This old retry endpoint reopens the legacy setup flow; it does not retry new sessions.
++    $("pc-retry-setup").hidden = !!bootstrap || runner?.status === "completed";
+   }
+ }
+ function taskLabel(state) {
+@@ -867,7 +882,7 @@
+   if (route.name === "task") await loadTaskDetail();
+   if (
+     route.name === "runner" ||
+-    (route.name === "computer" && route.section === "setup")
++    (route.name === "computer" && route.section === "setup" && !lastState.devices.find((d) => d.id === route.id)?.helper_bootstrap)
+   )
+     await refreshRunnerProfile({
+       deviceId: route.name === "computer" ? route.id : null,
